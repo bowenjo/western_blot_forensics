@@ -1,7 +1,10 @@
-import numpy as np 
 import cv2
+import numpy as np 
 import matplotlib.pyplot as plt 
-
+from sklearn.isotonic import IsotonicRegression
+from scipy.ndimage.filters import gaussian_filter1d
+from scipy.signal import argrelmax
+import itertools
 """
 Helpful utility functions for fingerprinting western blot images. 
 
@@ -112,7 +115,7 @@ def distThresh(dist_transform, spacing_num, area_weight = .35):
 
 	weight = (stats["num_cnts"] + area_weight*stats["mean_areas"])
 
-	return(possible_thresh[0]) #return(possible_thresh[np.argmax(weight)])
+	return(possible_thresh[np.argmax(weight)]) #return(possible_thresh[0]) #
 
 
 def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMALIZE = True, Visualize = False):
@@ -185,13 +188,21 @@ def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMAL
 		## Loop over column dimenion
 		col_idx = 0
 		for col in range(binShape[1]):
-
 			block_angle = angle[row_idx:row_idx+y_diff, col_idx:col_idx+x_diff] # block bins for angles
 			block_mag = mag_weighted[row_idx:row_idx+y_diff, col_idx:col_idx+x_diff] # block bins for magnitudes
+			
+			## trilinear interpolation method
+			oriented_mags = np.zeros(orientations) # intitalize magnitude accumulation vector 
+			centers = np.arange(bin_width / 2, 360 + bin_width / 2, bin_width)  # vector of centers of each bin
+			for idx, ang in enumerate(block_angle.flatten()): # loop through each block angle
+				d = np.abs(centers - ang) / bin_width # distance from angle value to centers of bin in terms of binwidth 
+				w = np.maximum(1-d, 0) # interpolate for distance within one bin width
+				oriented_mags += w * block_mag.flatten()[idx] # weight each magnitude by distance within one bin width of centers.
 
-			bins = [np.where(block_angle<=((idx+1)*bin_width)) for idx in range(orientations)] # label where orientations in angles is within a designated bin
-			oriented_mags = [np.sum(block_mag[b]) for b in bins] # accumulate magnitudes in given orientation bin
-			oriented_mags = np.hstack((np.array([oriented_mags[0]]), np.diff(oriented_mags))) # make sure non-cummulative between bins
+			## No interpolation method
+			# bins = [np.where(block_angle<=((idx+1)*bin_width)) for idx in range(orientations)] # label where orientations in angles is within a designated bin
+			# oriented_mags = [np.sum(block_mag[b]) for b in bins] # accumulate magnitudes in given orientation bin
+			# oriented_mags = np.hstack((np.array([oriented_mags[0]]), np.diff(oriented_mags))) # make sure non-cummulative between bins
 
 			# if L2_NORMALIZE is True: # l2 normalize over each block
 			# 	norm = np.linalg.norm(oriented_mags)
@@ -211,8 +222,6 @@ def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMAL
 		return(rsmpld_image, rsmpld_Gkernel, gx, gy, feature_vector)
 	else:
 		return(feature_vector)
-
-
 
 
 def pickBlockSize(ma, MA, blockShape=(4,8)):
@@ -273,195 +282,152 @@ def getGaussianKernel2D(ksize1, ksize2, sigma1, sigma2, maxValue=1):
 
 	return(kernel)
 
+def filterContourArea(contours, figure_size, alpha=1000, beta=.01):
+		areas = np.sort([cv2.contourArea(cnt) for cnt in contours])[::-1] # all areas
+		cnt_t = np.where(areas < (figure_size - alpha))[0][0] # designated maximum area index
+		cnt_f = np.where(areas < beta*areas[cnt_t])[0][0] # designate minimum area index
 
-def scale_and_invert(image, maxValue = 255):
+		return([cnt for cnt in contours if cv2.contourArea(cnt) in areas[cnt_t:cnt_f+1]]) # filter contours by designated bounds
+
+def approxAndExtractRect(figure, contours, epsilon, size_lim, whr_lim, mode_lim, shift_length, hist_lim):
+	# initialize vectors
+	figures = {"images": [],
+			   "grays": [],
+			   "loc": []
+			   }
+
+	# find contours in the figure
+	figure_gray = cv2.cvtColor(figure, cv2.COLOR_BGR2GRAY)
+
+	for cnt in contours:
+		percArc = epsilon * cv2.arcLength(cnt, True) # accuracy value a percentage of contour arc length
+		approx = cv2.approxPolyDP(cnt, percArc, True) # approximate the contour to a simpler shape (i.e diagnol line, rectangle, etc.)
+		x,y,w,h = cv2.boundingRect(approx) # create bounding rectangle to extract region of interest around approximated contour
+		roi = figure[y:np.minimum(y+h, figure_gray.shape[0]), x:np.minimum(x+w, figure_gray.shape[1]), :]
+		figures["images"].append(roi)
+		figures["grays"].append(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
+		figures["loc"].append((x,y,w,h))
+
+	# delete overlapping regions
+	masks = [rectMask(figure_gray.shape, loc) for loc in figures["loc"]]
+	mask_idx = list(itertools.combinations(range(len(masks)), 2))
+	masks_combos = itertools.combinations(masks, 2)
+
+	delete_idx = []
+	for i, combo in enumerate(masks_combos):
+		combined = np.sum(np.add(combo[0], combo[1])) # look at mask intercept
+		if np.any(combined==2):
+			if np.size(combo[0]) < np.size(combo[1]):
+				delete_idx.append(mask_idx[i][0])
+			else:
+				delete_idx.append(mask_idx[i][1])
+
+	overlap_idx = [i for i, loc in enumerate(figures["loc"]) if i not in delete_idx]
+	figures = updateDictionary(figures, overlap_idx)
+
+	print(overlap_idx)
+
+	# filter by size
+	sizes = np.sort([np.size(roi) for roi in figures["grays"]])[::-1]
+	size_t, size_f = filterByIndex(sizes, size_lim)
+	size_idx = [i for i, roi in enumerate(figures["grays"]) if np.size(roi) in sizes[size_t:size_f]]
+	figures = updateDictionary(figures, size_idx)
+
+	print(size_idx)
+
+	# filter by shape ratio
+	wh_ratio = np.sort([roi.shape[1]/roi.shape[0] for roi in figures["grays"]])[::-1]
+	wh_ratio_t, wh_ratio_f = filterByIndex(wh_ratio, whr_lim)
+	shape_idx = [i for i, roi in enumerate(figures["grays"]) if (roi.shape[1]/roi.shape[0]) in wh_ratio[wh_ratio_t:wh_ratio_f]]
+	figures = updateDictionary(figures, shape_idx)
+
+	print(shape_idx)
+
+	# filter based on mode of histograms
+	hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
+	mode_ratio = np.sort([np.max(hist) for hist in hists])[::-1]
+	mode_ratio_t, mode_ratio_f = filterByIndex(mode_ratio, mode_lim)
+	mode_idx = [i for i, hist in enumerate(hists) if np.max(hist) in mode_ratio[mode_ratio_t:mode_ratio_f]]
+	figures = updateDictionary(figures, mode_idx) 
+
+	print(mode_idx)
+
+	# filter based on distribution around mode
+	hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
+	hist_idx = []
+	for i, hist in enumerate(hists):
+		mode = np.argmax(hist)
+		try:
+			# right-shifted ratio
+			right_shift = np.arange(1, shift_length+1) + mode
+			if hist[mode] / np.sum(hist[right_shift]) < hist_lim:
+				hist_idx.append(i)
+		except IndexError:
+			# left-shifted ratio
+			left_shift = np.arange(-shift_length-1, -1) + mode
+			if hist[mode] / np.sum(hist[left_shift]) < hist_lim:
+				hist_idx.append(i)
+		except RuntimeWarning:
+			continue
+	print(hist_idx)
+
+	figures = updateDictionary(figures, hist_idx)
+	#del figures["grays"]
+
+	return(figures)
+
+def filterByIndex(sorted_list, limit):
+	try:
+		t = np.where(sorted_list < (np.mean(sorted_list) + limit[0] * np.std(sorted_list)))[0][0]
+		if t is None:
+			t = 0
+	except IndexError:
+		t = 0
+	try:
+		f = np.where(sorted_list < (np.mean(sorted_list) - limit[1] * np.std(sorted_list)))[0][0]
+		if f is None:
+			f = len(sorted_list)
+	except IndexError:
+		f = len(sorted_list)
+
+	return(t, f)
+
+def rectMask(shape, rect):
+	mask = np.zeros(shape)
+	mask[rect[1]:np.minimum(rect[1]+rect[3], shape[0]), rect[0]:np.minimum(rect[0]+rect[2], shape[1])] = 1
+	return(mask)
+
+def updateDictionary(dictionary, index):
+	if len(index) == 0:
+		print("Had no effect on updating the dictionary")
+		pass
+	else:
+		for key in dictionary.keys():
+			dictionary[key] = np.array(dictionary[key])[index]
+
+	return(dictionary)
+
+def contrastFilters(figure, break_point):
 	"""
-	scales and inverts a [0,255] (uint8) image type to be within [0,1] with same number of bins
-	"""
-	return(1/maxValue * cv2.bitwise_not(image))
-
-
-##  ----------------------------Below this line are outdated functions---------------------------------------------------------------------------------------------------
-
-
-def centroid(cnt):
-	"""
-	Gives the position of the center of mass of a given grayscale image based on first-order moments
-
-	Parameters:
-	------------
-	cnt: list
-		list of x-y coordinate pairs defining the contour of an object
-	Returns:
-	------------
-	centroid: numpy array
-		x,y coordinate of centroid in image
-	"""
-	M = cv2.moments(cnt)
-	centroid = (int(round(M['m10']/M['m00'])), int(round(M['m01']/M['m00'])))
-
-	return(centroid)
-
-
-
-
-
-def get_Orientation(image, moments, draw=True):
-	"""
-	Gives the orientation angle and axe lengthes of a given object relative to a typical horizontal axis by 2nd-order image moments
-
-	Parameters:
-	------------
-	image: numpy array 
-		two-dimensional image array to be drawn on
-	moments: dictionary 
-		dictionary of moments for a given grayscale image 
-	draw: boolean (default: True)
-		determines if the principal will be drawn on image
-
-	Returns:
-	------------
-	theta: float
-		orientation angle of image object relative to typical horizontal axis
-	axes: tuple (MA, ma)
-		maximum(MA) and minimum(ma) principal axe lengths 
+	Creates a ReLU function with breaking point defined by break_point parameter.
 	"""
 
+	if break_point < 0 or break_point > 1:
+		raise ValueError("break_point must be a real number between zero and one")
 
-	M = moments
-	c = centroid(image, M, draw)
+	ydata = np.array([0, 0, 1]) * 255
+	xdata = np.array([0, break_point, 1]) * 255
 
-	# pseudo-normalized central moments
-	mu11_p = M['mu11']/M['m00']
-	mu20_p = M['mu20']/M['m00']
-	mu02_p = M['mu02']/M['m00']
-
-	# principal axe lengths
-	alpha = (mu20_p + mu02_p)/2
-	beta = np.sqrt((4*(mu11_p**2) + (mu20_p-mu02_p)**2)/2)
-	lamdas = (alpha+beta, alpha-beta)
-	MA = np.max(np.abs(lamdas))
-	ma = np.min(np.abs(lamdas))
-
-	# orientation angle
-	theta = .5 * np.arctan(2 * mu11_p / (mu20_p - mu02_p + np.finfo(float).eps))
-
-	# Draw Orinetation Lines 
-	theta = 1 + np.floor(theta * 180/np.pi)
-	axes = (MA, ma)
-	if draw is True:
-		## find max-axis point
-		max_line_x = c[0] + 14 * np.cos(theta*np.pi/180)
-		max_line_y = c[1] + 14 * np.sin(theta*np.pi/180)
-		max_pt = (int(max_line_x), int(max_line_y))
-
-		## find min-axis point
-		min_line_x = c[0] + 3 * np.cos(theta*np.pi/180-(np.pi/2))
-		min_line_y = c[1] + 3 * np.sin(theta*np.pi/180-(np.pi/2))
-		min_pt = (int(min_line_x), int(min_line_y))
-
-		cv2.line(image, c, max_pt, (0), 1)
-		cv2.line(image, c, min_pt, (0), 1)
-
-	return(theta, axes)
-
-
-
-def boundingRectangle(epsilon, cnt=None, x=None, y=None, MA=None, ma=None, angle=None):
-	"""
-	Creates the dimensions of a bounding box based off of the dimensions of the principal axes and orientation
+	shape = figure.shape
 	
-	TODO: raise error if angle not in radians
+	ir = IsotonicRegression()
+	ir.fit(xdata, ydata)
+	y_ = ir.transform(figure.flatten()).reshape(shape)
 
-	Parameters:
-	----------
-	cnt: list
-		list of x-y coordinates that describe a contour of the object. Use this or specify the following
-	x: int 
-		x-coordinate of center point
-	y: int
-		y-coordinate of center point
-	MA: int
-		maximum fitted ellipse axis length
-	ma: int
-		minimum fitted ellipse axis length
-	angle: float
-		orientation angle with respect to typical horizontal axis (radians)
-	epsilon: float
-		noise value to extend bounding box by small amount
-
-	Returns:
-	----------
-	x: int 
-		x-coordinate of center point
-	y: int
-		y-coordinate of center point
-	base: int
-		length of base of bounding box
-	height: int
-		length of height of bounding box
-	br_pt: tuple
-		x-y coordinate of top-left corner of bounding box
-	"""
-
-	## fit ellipse
-	if cnt is not None:
-		(x,y), (ma,MA), angle = cv2.fitEllipse(cnt)
-		angle = angle*np.pi/180
-
-	## find base, height, top-left corner of bounding box relative to center point.
-	base = np.abs(ma * np.cos(angle)) + np.abs(MA * np.cos(angle + np.pi/2)) + epsilon
-	base = int(round(base))
-	height = np.abs(ma * np.sin(angle)) + np.abs(MA * np.sin(angle + np.pi/2)) + epsilon
-	height = int(round(height))
-	br_pt = (int(round(x - base/2)), int(round(y - height/2)))
-	angle = angle*180/np.pi
-
-	return(x, y, MA, ma, angle, base, height, br_pt)
-	
+	return(np.uint8(y_))
 
 
 
-
-def scaleContour(cnt, x, y, cnt_scale):
-	"""
-	Linearly scales a contour by given scale factor
-
-	Parameters:
-	-------------
-	cnt: list
-		list of x-y coordinates that describe a contour of the object 
-	x: int
-		x-coordinate of center point 
-	y: int
-		y-coordinate of center point
-	cnt_scale: float
-		linear scale factor
-
-	Returns:
-	-------------
-	cnt_scaled: list
-		list of x-y coordinates that describe a scaled contour of the object 
-	"""
-
-	## Define scale and translation matix
-	scale_matrix = np.array([[cnt_scale, 0],[0, cnt_scale]])
-	trans_matrix = np.array([x, y]) 
-
-	## Linearly scale contour
-	cnt_scaled = np.array([trans_matrix + (pnt - trans_matrix) @ scale_matrix for pnt in cnt]).astype(int)
-
-	return(cnt_scaled)
-
-
-
-def ellipseDiameter(theta, MA, ma):
-	"""
-	find diameter of an ellipse given a angle theta away from its major axis
-	"""
-	d = (MA*ma) / np.sqrt((ma*np.cos(theta))**2 + (MA*np.sin(theta))**2)
-
-	return(d)
 
 
 
