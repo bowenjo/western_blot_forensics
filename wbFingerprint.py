@@ -14,9 +14,7 @@ CLASS FOR FINGERPRINTING WESTERN BLOT PLOTS FOR IMAGE FORENSICS
 """
 ##TODO: 
 	  #	X for blots with connected portions: Look into a more refined object recognition algorithm (watershed segmentation).
-	  # refine area selection/filtering in utils.
-	  # perhaps instead of raw pixels, take slices through center of mass (along principal axes defined by ellipse). Rotation invariance, no need to normalize orientation.
-	  # taking slices could also be scale invariant if slice distribution is normalized/approximated
+	  # X refine area selection/filtering in utils.
 	  # add in work around to None blots if they occur.
 	  # X design a better equalization function that ignores black background(utils). 
 	  # decide which angle measurement is better: from moments or from fitted ellipse
@@ -66,7 +64,8 @@ class WesternBlot(object):
 		#self.location = self.readFileFromFolder(dir_dictionary, label='image_urls', folder=None) # dir_dictionary  #could be title, article url, authors, publisher, etc.
 
 		self.EPSILON = 4 # corrects noise due to ellipse overfitting
-		self.EPSILON_TWO = 1/64 # set to a fraction of image_gray.size to filter small blots 
+		self.EPSILON_TWO = 1/200 # set to a fraction of image_gray.size to filter small blots
+		self.IdealDescriptor = np.load("ideal_descriptor.npy") 
 
 	def readFileFromFolder(self, dir_dictionary, label, folder=None):
 		"""
@@ -175,7 +174,8 @@ class WesternBlot(object):
 		# loop over each image in figures:
 		for _, image in enumerate(self.images["images"]):
 			fingerprint, centroid_angles = self.blotExtractorWatershed(image, maxValue=255)
-			self.imshowBlots(fingerprint["blots"], title=str(_))
+			if len(fingerprint["blots"]) != 0:
+				self.imshowBlots(fingerprint["blots"], title=str(_))
 		plt.show()
 		
 	def blotExtractorWatershed(self, image, maxValue, inv_thresh=100, kernelSize = (3,3), num_bins=256, Visualize=True, EQUALIZE=False):
@@ -234,8 +234,9 @@ class WesternBlot(object):
 		## Find sure foreground area
 		dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5) # distance transform to find sure foreground
 		dist_thresh = utils.distThresh(dist_transform, 20) # must find a threshold that maximizes number of sure regions
-		sure_fg = cv2.threshold(dist_transform, dist_thresh*dist_transform.max(), 255, 0)[1]
-		sure_fg = np.uint8(sure_fg)
+		sure_fg = np.uint8(cv2.threshold(dist_transform, dist_thresh*dist_transform.max(), 255, 0)[1])
+		sure_fg = utils.adaptiveDilation(sure_fg)
+		#sure_fg = # np.uint8(cv2.dilate(sure_fg, kernel, iterations=2))#cv2.morphologyEx(np.uint8(sure_fg), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5)))
 
 		## Find unknown region
 		unknown = cv2.subtract(sure_bg, sure_fg) 
@@ -322,6 +323,9 @@ class WesternBlot(object):
 
 			## compute blot gradient (magnitude and direction)
 			des = utils.HOG(rotated_blot, blockShape = (6,24), binShape = (2,4), orientations = 8, L2_NORMALIZE = True)
+			if np.linalg.norm(self.IdealDescriptor - des) > 1.0:
+				print("Not a blot!")
+				continue
 
 			## extract cdf
 			hist = np.histogram(blot.flatten(), num_bins, [0, num_bins], density = False)[0]
@@ -480,7 +484,7 @@ def main():
 	#data = np.load("testData/test_westernblots.npy") # need to bring in as list of jpeg files
 
 	#Fingerprints = []
-	for dir_dictionary in [data[650]]:
+	for dir_dictionary in [data[550]]:
 		WB = WesternBlot(dir_dictionary, label="images", folder="nature_wb_output")
 		WB.westernBlotExtractor()
 		#WB.blotExtractorWatershed(255)

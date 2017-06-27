@@ -64,9 +64,11 @@ def normalize(array):
 	return((array-np.min(array))/(np.max(array) - np.min(array) + np.finfo(float).eps))
 
 
-def distThresh(dist_transform, spacing_num, area_weight = .35):
+def distThresh(dist_transform, spacing_num):
 	"""
 	computes the distance threshold based on a weighting function maximizing number of contours and total area.
+	
+	#TODO: update weighting method for increased accuracy at extracting blots. Perhaps ncorporate variance and mean area. 
 
 	Parameters:
 	------------
@@ -78,44 +80,62 @@ def distThresh(dist_transform, spacing_num, area_weight = .35):
 		weights the effect total area has on determination of the distance threshold
 
 	"""
-	stats = {"num_cnts":[], 
-			 "mean_areas":[], 
-			 "var_areas":[]
-			}
+	stats = {"num_cnts":[]}
 
 	possible_thresh = np.linspace(0, 1, spacing_num)[1:]
 	for t in possible_thresh:
-		thresh_image = cv2.threshold(dist_transform,t*dist_transform.max(),255,0)[1]
-		thresh_image = np.uint8(thresh_image)
+		thresh_image = np.uint8(cv2.threshold(dist_transform,t*dist_transform.max(),255,0)[1])
 		cnts = cv2.findContours(thresh_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[1]
-
-		## filter ontours by area
-		# areas = [cv2.contourArea(cnt) for cnt in cnts] # list of all contour areas using 0th image moment
-		# areas = [a for a in areas if np.abs(a-np.mean(areas)) < np.std(areas)] # remove outliers
-		# cnts = [cnt for cnt in cnts if cv2.contourArea(cnt) in areas]
-
-		if len(cnts) != 0:
-			mean_area = np.mean([cv2.contourArea(cnt) for cnt in cnts])
-			var_area = np.var([cv2.contourArea(cnt) for cnt in cnts])
-		else:
-			mean_area = 0
-
-		stats["mean_areas"].append(mean_area)
-		stats["var_areas"].append(var_area)
 		stats["num_cnts"].append(len(cnts))
-	# print("Number of blots for each distance threshold value:", num_cnts)	
 
-	##TODO: update weighting method for increased accuracy at extracting blots
-	#loc = np.where(np.array(stats["num_cnts"]) == 1)
+	weight = (stats["num_cnts"])
 
-	stats["num_cnts"] = normalize(np.array(stats["num_cnts"]))
-	stats["mean_areas"] = normalize(np.array(stats["mean_areas"]))
-	stats["var_areas"] = normalize(np.array(stats["var_areas"]))
+	return(possible_thresh[np.argmax(weight)]) 
+
+def adaptiveDilation(binary_image, maxKernelSize=5, iterations=1, structure = cv2.MORPH_ELLIPSE):
+	"""
+	Does adaptive morphological dilation on binary images. Designed to do more dilation for segments with smaller area, 
+	and less dilation for those with large area. 
+
+	#TODO: use the variance (or other statistical measure) to weight the kernel size. So when the variance of the blots are lower, do less dilation. 
+
+	Parameters:
+	-------------
+	binary_image: numpy array
+		binary image to have dilation applied to
+	maxKernelSize: int (default = 7)
+		sets the maximum kernel size for dilation
+	iterations: int (default = 1)
+		sets the number of iterations to perform morphological dilation
+	structure: cv2 object (default = cv2.MORPH_ELLIPSE)
+		determines the shape of the kernel used for dilation
+
+	Returns:
+	------------
+	dilated_image: numpy array
+		output binary image after adaptive dilation
+	"""
+	copy = binary_image.copy()
+
+	contours = cv2.findContours(copy, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[1] # find outlines of binary image
+	areas = np.array([cv2.contourArea(cnt) for cnt in contours]) # compute area
+	kernelSizes = np.around(maxKernelSize * (1 - areas / np.sum(areas))).astype(int) # get the kernel size weighted by area
+
+	dilated_image = np.zeros(binary_image.shape, dtype=np.uint8) # intitialize dileated image
+	for i, cnt in enumerate(contours):
+		mask = np.zeros(binary_image.shape, dtype=np.uint8) # intitialize background mask
+		cv2.drawContours(mask, [cnt], 0, (255), -1) # fill in contour outline for each contour
+
+		if kernelSizes[i] % 2 == 0: # make sure kernel size is odd
+			kernelSizes[i] = kernelSizes[i] + 1
+
+		kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernelSizes[i], kernelSizes[i])) # create kernel
+		mask = cv2.dilate(mask, kernel, iterations = iterations) # dilate masked image for each filled in contour
+		dilated_image = cv2.add(dilated_image, mask) # add new filled-in outlined image to dilated image 
+	
+	return(dilated_image)
 
 
-	weight = (stats["num_cnts"] + area_weight*stats["mean_areas"])
-
-	return(possible_thresh[np.argmax(weight)]) #return(possible_thresh[0]) #
 
 
 def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMALIZE = True, Visualize = False):
