@@ -2,9 +2,13 @@ import cv2
 import numpy as np 
 import matplotlib.pyplot as plt 
 from sklearn.isotonic import IsotonicRegression
+from scipy import ndimage as ndi 
 from scipy.ndimage.filters import gaussian_filter1d
-from scipy.signal import argrelmax
-import itertools
+from scipy.signal import argrelmin
+from scipy.spatial import KDTree
+import itertools as itt
+from skimage.morphology import watershed
+from skimage.feature import peak_local_max
 """
 Helpful utility functions for fingerprinting western blot images. 
 
@@ -49,14 +53,13 @@ def equalizeImage(image, num_bins = 256):
 
 
 	## equalize image
-	equ_image = list(map(lambda x: equalizer(x, equ_LookUp), list(image.flatten())))
+	equ_image = list(map(lambda x: _equalizer(x, equ_LookUp), list(image.flatten())))
 	equ_image = np.array(equ_image).reshape(image.shape)
 
 	return(equ_image)
 
 
-
-def equalizer(v, equ_LookUp):
+def _equalizer(v, equ_LookUp):
 	return(equ_LookUp[v])
 
 
@@ -92,6 +95,7 @@ def distThresh(dist_transform, spacing_num):
 
 	return(possible_thresh[np.argmax(weight)]) 
 
+
 def adaptiveDilation(binary_image, maxKernelSize=5, iterations=1, structure = cv2.MORPH_ELLIPSE):
 	"""
 	Does adaptive morphological dilation on binary images. Designed to do more dilation for segments with smaller area, 
@@ -118,8 +122,8 @@ def adaptiveDilation(binary_image, maxKernelSize=5, iterations=1, structure = cv
 	copy = binary_image.copy()
 
 	contours = cv2.findContours(copy, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[1] # find outlines of binary image
-	areas = np.array([cv2.contourArea(cnt) for cnt in contours]) # compute area
-	kernelSizes = np.around(maxKernelSize * (1 - areas / np.sum(areas))).astype(int) # get the kernel size weighted by area
+	areas = np.abs(np.array([cv2.contourArea(cnt) for cnt in contours])) # compute area
+	kernelSizes = np.maximum(np.around(maxKernelSize * (1 - areas / (np.sum(areas) + np.finfo(float).eps))).astype(int), 0) # get the kernel size weighted by area
 
 	dilated_image = np.zeros(binary_image.shape, dtype=np.uint8) # intitialize dileated image
 	for i, cnt in enumerate(contours):
@@ -128,14 +132,14 @@ def adaptiveDilation(binary_image, maxKernelSize=5, iterations=1, structure = cv
 
 		if kernelSizes[i] % 2 == 0: # make sure kernel size is odd
 			kernelSizes[i] = kernelSizes[i] + 1
+		#print(kernelSizes[i])
 
-		kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernelSizes[i], kernelSizes[i])) # create kernel
+		#kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernelSizes[i], kernelSizes[i])) # create kernel
+		kernel = np.ones((kernelSizes[i],kernelSizes[i]), dtype=np.uint8)
 		mask = cv2.dilate(mask, kernel, iterations = iterations) # dilate masked image for each filled in contour
 		dilated_image = cv2.add(dilated_image, mask) # add new filled-in outlined image to dilated image 
 	
 	return(dilated_image)
-
-
 
 
 def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMALIZE = True, Visualize = False):
@@ -190,7 +194,7 @@ def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMAL
 	else:
 		ksize2_odd = ksize2
 
-	Gkernel = getGaussianKernel2D(ksize1_odd, ksize2_odd, sigma1=ksize1_odd/2, sigma2=ksize2_odd/2, maxValue=1) # get 2D gaussian kernel
+	Gkernel = _getGaussianKernel2D(ksize1_odd, ksize2_odd, sigma1=ksize1_odd/2, sigma2=ksize2_odd/2, maxValue=1) # get 2D gaussian kernel
 	rsmpld_Gkernel = cv2.resize(Gkernel, (ksize2, ksize1)) # resample to fit size of mag
 
 	## weight the magnitudes by gaussian weighting function
@@ -236,7 +240,10 @@ def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMAL
 
 	if L2_NORMALIZE is True: # l2 normalize over each bin
 		norm = np.linalg.norm(feature_vector)
-		feature_vector = feature_vector/norm
+		if norm != 0:
+			feature_vector = feature_vector/norm
+		else:
+			return(None)
 
 	if Visualize is True:
 		return(rsmpld_image, rsmpld_Gkernel, gx, gy, feature_vector)
@@ -271,7 +278,7 @@ def pickBlockSize(ma, MA, blockShape=(4,8)):
 
 	return(y,x)
 
-def getGaussianKernel2D(ksize1, ksize2, sigma1, sigma2, maxValue=1):
+def _getGaussianKernel2D(ksize1, ksize2, sigma1, sigma2, maxValue=1):
 	"""
 	creates a a 2D gaussian kernel of dimension (ksize1 x ksize2) with standard deviation sigma and maximum value equal to maxValue
 
@@ -303,14 +310,31 @@ def getGaussianKernel2D(ksize1, ksize2, sigma1, sigma2, maxValue=1):
 	return(kernel)
 
 def filterContourArea(contours, figure_size, alpha=1000, beta=.01):
+		if len(contours) == 0:
+			return(None)
+
 		areas = np.sort([cv2.contourArea(cnt) for cnt in contours])[::-1] # all areas
-		cnt_t = np.where(areas < (figure_size - alpha))[0][0] # designated maximum area index
-		cnt_f = np.where(areas < beta*areas[cnt_t])[0][0] # designate minimum area index
+		try:
+			cnt_t = np.where(areas < (figure_size - alpha))[0][0] # designated maximum area index
+			if cnt_t is None:
+				cnt_t = 0
+		except IndexError:
+			cnt_t = 0
+		try:
+			cnt_f = np.where(areas < beta*areas[cnt_t])[0][0] # designate minimum area inde
+			if cnt_f is None:
+				cnt_f = len(areas)
+		except IndexError:
+			cnt_f = len(areas)
 
 		return([cnt for cnt in contours if cv2.contourArea(cnt) in areas[cnt_t:cnt_f+1]]) # filter contours by designated bounds
 
 def approxAndExtractRect(figure, contours, epsilon, size_lim, whr_lim, mode_lim, shift_length, hist_lim):
 	# initialize vectors
+	if contours is None:
+		print("There were no contours in the image")
+		return(None)
+
 	figures = {"images": [],
 			   "grays": [],
 			   "loc": []
@@ -329,13 +353,13 @@ def approxAndExtractRect(figure, contours, epsilon, size_lim, whr_lim, mode_lim,
 		figures["loc"].append((x,y,w,h))
 
 	# delete overlapping regions
-	masks = [rectMask(figure_gray.shape, loc) for loc in figures["loc"]]
-	mask_idx = list(itertools.combinations(range(len(masks)), 2))
-	masks_combos = itertools.combinations(masks, 2)
+	masks = [_rectMask(figure_gray.shape, loc) for loc in figures["loc"]]
+	mask_idx = list(itt.combinations(range(len(masks)), 2))
+	masks_combos = list(itt.combinations(masks, 2))
 
 	delete_idx = []
 	for i, combo in enumerate(masks_combos):
-		combined = np.sum(np.add(combo[0], combo[1])) # look at mask intercept
+		combined = np.add(combo[0], combo[1])# look at mask intercept
 		if np.any(combined==2):
 			if np.size(combo[0]) < np.size(combo[1]):
 				delete_idx.append(mask_idx[i][0])
@@ -343,34 +367,34 @@ def approxAndExtractRect(figure, contours, epsilon, size_lim, whr_lim, mode_lim,
 				delete_idx.append(mask_idx[i][1])
 
 	overlap_idx = [i for i, loc in enumerate(figures["loc"]) if i not in delete_idx]
-	figures = updateDictionary(figures, overlap_idx)
-
-	print(overlap_idx)
+	figures = _updateDictionary(figures, overlap_idx)
+	if figures is None:
+		return(None)
 
 	# filter by size
 	sizes = np.sort([np.size(roi) for roi in figures["grays"]])[::-1]
-	size_t, size_f = filterByIndex(sizes, size_lim)
+	size_t, size_f = _filterByIndex(sizes, size_lim)
 	size_idx = [i for i, roi in enumerate(figures["grays"]) if np.size(roi) in sizes[size_t:size_f]]
-	figures = updateDictionary(figures, size_idx)
-
-	print(size_idx)
+	figures = _updateDictionary(figures, size_idx)
+	if figures is None:
+		return(None)
 
 	# filter by shape ratio
 	wh_ratio = np.sort([roi.shape[1]/roi.shape[0] for roi in figures["grays"]])[::-1]
-	wh_ratio_t, wh_ratio_f = filterByIndex(wh_ratio, whr_lim)
+	wh_ratio_t, wh_ratio_f = _filterByIndex(wh_ratio, whr_lim)
 	shape_idx = [i for i, roi in enumerate(figures["grays"]) if (roi.shape[1]/roi.shape[0]) in wh_ratio[wh_ratio_t:wh_ratio_f]]
-	figures = updateDictionary(figures, shape_idx)
-
-	print(shape_idx)
+	figures = _updateDictionary(figures, shape_idx)
+	if figures is None:
+		return(None)
 
 	# filter based on mode of histograms
 	hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
 	mode_ratio = np.sort([np.max(hist) for hist in hists])[::-1]
-	mode_ratio_t, mode_ratio_f = filterByIndex(mode_ratio, mode_lim)
+	mode_ratio_t, mode_ratio_f = _filterByIndex(mode_ratio, mode_lim)
 	mode_idx = [i for i, hist in enumerate(hists) if np.max(hist) in mode_ratio[mode_ratio_t:mode_ratio_f]]
-	figures = updateDictionary(figures, mode_idx) 
-
-	print(mode_idx)
+	figures = _updateDictionary(figures, mode_idx) 
+	if figures is None:
+		return(None)
 
 	# filter based on distribution around mode
 	hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
@@ -380,23 +404,25 @@ def approxAndExtractRect(figure, contours, epsilon, size_lim, whr_lim, mode_lim,
 		try:
 			# right-shifted ratio
 			right_shift = np.arange(1, shift_length+1) + mode
-			if hist[mode] / np.sum(hist[right_shift]) < hist_lim:
+			if hist[mode] / (np.sum(hist[right_shift]) + np.finfo(float).eps) < hist_lim:
 				hist_idx.append(i)
 		except IndexError:
 			# left-shifted ratio
 			left_shift = np.arange(-shift_length-1, -1) + mode
-			if hist[mode] / np.sum(hist[left_shift]) < hist_lim:
+			if hist[mode] / (np.sum(hist[left_shift]) + np.finfo(float).eps) < hist_lim:
 				hist_idx.append(i)
-		except RuntimeWarning:
-			continue
-	print(hist_idx)
 
-	figures = updateDictionary(figures, hist_idx)
+	figures = _updateDictionary(figures, hist_idx)
+	if figures is None:
+		return(None)
+
+	# convert to array
+	figures["loc"] = np.array(figures["loc"])
 	#del figures["grays"]
 
 	return(figures)
 
-def filterByIndex(sorted_list, limit):
+def _filterByIndex(sorted_list, limit):
 	try:
 		t = np.where(sorted_list < (np.mean(sorted_list) + limit[0] * np.std(sorted_list)))[0][0]
 		if t is None:
@@ -412,15 +438,14 @@ def filterByIndex(sorted_list, limit):
 
 	return(t, f)
 
-def rectMask(shape, rect):
+def _rectMask(shape, rect):
 	mask = np.zeros(shape)
 	mask[rect[1]:np.minimum(rect[1]+rect[3], shape[0]), rect[0]:np.minimum(rect[0]+rect[2], shape[1])] = 1
 	return(mask)
 
-def updateDictionary(dictionary, index):
+def _updateDictionary(dictionary, index):
 	if len(index) == 0:
-		print("Had no effect on updating the dictionary")
-		pass
+		return(None)
 	else:
 		for key in dictionary.keys():
 			dictionary[key] = np.array(dictionary[key])[index]
@@ -429,7 +454,7 @@ def updateDictionary(dictionary, index):
 
 def contrastFilters(figure, break_point):
 	"""
-	Creates a ReLU function with breaking point defined by break_point parameter.
+	Creates a saturation function with breaking point defined by break_point parameter.
 	"""
 
 	if break_point < 0 or break_point > 1:
@@ -445,6 +470,254 @@ def contrastFilters(figure, break_point):
 	y_ = ir.transform(figure.flatten()).reshape(shape)
 
 	return(np.uint8(y_))
+
+def detectLocalMinima(image, k, g_k, T, w, dub, c, slope_angle, order=1, VISUALIZE=False):
+	"""
+	detects local intensity minima in multiplets. Inspired by M.A. Savelonas et al. 2011
+
+	Parameters:
+	------------
+	image: numpy array 
+		2D gray-scale image in numpy array format
+	k: int
+		median filter kernel size
+	T: uint8
+		intensity threshold value. local intensity minima must exceed this value to be classified as minima
+	w: float
+		width of square sub-segment in which local minima must be global minima
+	order: int (default: 1)
+		How many points on each side to use for the comparison to consider
+
+	Returns:
+	-------------
+	local_mins: (n,2) numpy array
+		array of 2D locations of local minima within image
+	"""
+	# apply k x k median filter
+	image = cv2.medianBlur(image, k)
+	image = cv2.GaussianBlur(image, (g_k,g_k), 0)
+
+	# Find all indices of local min in each cardinal diection of 'image'
+	arg_local_min_x = np.asarray(argrelmin(image, order=order, axis=1)).T # indices of all local min in x-direction
+	arg_local_min_y = np.asarray(argrelmin(image, order=order, axis=0)).T # indiced of all local min in y-direction
+
+	# criterion 1: threshold local minima to be greater than or equal to 'T'
+	arg_local_min_x = [k for k in arg_local_min_x if image[tuple(k)] >= T] # threshold x-direction local min
+	arg_local_min_y = [k for k in arg_local_min_y if image[tuple(k)] >= T] # threshold y-direction local min
+
+
+	try:
+		arg_local_min =  arg_local_min_x + arg_local_min_y
+	except ValueError:
+		if len(arg_local_min_x) == 0:
+			arg_local_min = arg_local_min_y
+		elif len(arg_local_min_y) == 0:
+			arg_local_min = arg_local_min_x
+		elif len(arg_local_min_x) == 0 and len(arg_local_min_y) == 0:
+			print("No local minima detected. Adjust threshold T as necessary")
+			return(None, image) 
+		else:
+			raise ValueError("operands of shape %r and %r could not be broadcast together"%(arg_local_min_x.shape, arg_local_min_y.shape))
+
+	# criterion 2: local min must be global min in square neighborhood wth width w
+	local_mins = []
+	for k in arg_local_min:
+		local_min = image[tuple(k)]
+		# define bounds of square
+		lbx = int(np.maximum(k[0] - w/2, 0))
+		ubx = int(np.minimum(k[0] + w/2, image.shape[0]))
+		lby = int(np.maximum(k[1] - w/2, 0))
+		uby = int(np.minimum(k[1] + w/2, image.shape[1]))
+		# find global min of image sub-section
+		nbrh_min = np.min(image[lbx:ubx, lby:uby])
+		# check if k is global min of sub-section defined by w
+		if local_min <= nbrh_min:
+			local_mins.append(k)
+
+	if len(local_mins) != 0:
+		local_mins = np.vstack(local_mins)
+	else:
+		print("There were no border lines detected")
+		return(None, image)
+
+	# use kd-tree to find nearest neighbors
+	Tree = KDTree(local_mins) # create KDTree object
+	dists, locs = Tree.query(local_mins, k=7, distance_upper_bound = dub) # find nearest neighbors 
+
+	# group results of k-nearest neighbors into clusters
+	notInf = [i for i, x in enumerate(dists[:, 1:]) if _notInf(x)>=3] # remove single/double clusters
+	locs = locs[notInf] 
+
+	# group the results into clusters
+	clustered_min = []
+	for i, loc in enumerate(locs):
+		clust = []
+		for l in loc:
+			if l != len(local_mins):
+				if l not in [m for sublist in clustered_min for m in sublist]:
+					clust.append(l)
+		if len(clust) != 0:
+			clustered_min.append(clust)
+	clustered_min = [local_mins[clust] for clust in clustered_min]
+
+	# fit lines to clusters using opencv's least squares line fitting algorithm
+	fit_lines = [cv2.fitLine(clust, cv2.DIST_L2, 0, .01, .01) for clust in clustered_min if len(clust)>=3] # make sure there are at least 3 points in a cluster
+
+	# Filter unwanted slopes (i.e. not approx vertical or approx. horizontal)
+	del_idx = []
+	for _, line in enumerate(fit_lines):
+		slope = np.arctan(np.abs(line[0]/(line[1] + np.finfo(float).eps))) * 180/np.pi # calculate slope of fitted line
+		if slope < slope_angle[0] and slope > slope_angle[1]: # delete line if within slope_angle range
+			del_idx.append(_)
+
+	fit_lines = [fit_lines[i] for i, line in enumerate(fit_lines) if i not in del_idx]  
+
+	copy= image.copy()
+	for line in fit_lines:
+		pt1 = (line[3] - c*line[1], line[2] - c*line[0])
+		pt2 = (line[3] + c*line[1], line[2] + c*line[0])
+		cv2.line(copy, pt1, pt2, color = (0), thickness=1)
+
+	if VISUALIZE is True:
+		plt.figure(figsize=(7,3))
+		plt.imshow(copy, "gray")
+		plt.axis("off")
+		plt.title("Border lines calculated from local minima")
+
+	return(fit_lines, copy)
+
+def _notInf(numbers):
+	count = 0
+	for num in numbers:
+		if not np.isinf(num):
+			count+=1
+	return(count)
+
+def CLAHE(image, clipLimit, tileGridSize):
+	"""
+	Parameters:
+	------------
+	image: numpy array
+	clipLimit: float
+	tileGridSize: tuple 
+
+	Returns:
+	------------
+	adaptive histogram equalizated image
+
+	"""
+
+	clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
+	return(clahe.apply(image))
+
+def gwWatershed(image, md_k, se_k, g_k, grad_weight, maxValue=255, VISUALIZE=False):
+	"""
+	Gradient-weighted watershed transform. Inspired by Lin et. al. 2003
+
+	Parameters:
+	-------------
+	image: numpy array
+		gray-scale intensity image
+	k: int
+		median filter kernel size
+	maxValue: uint8 (default=255)
+		maximim value for otsu thresholding function
+
+	Returns:
+	-------------
+
+	"""
+
+	# preprocess image
+	median_filter = cv2.medianBlur(image, md_k) # median filter
+	#median_filter = CLAHE(median_filter, clipLimit = 2, tileGridSize=(5,5))
+	gaussian_filter = cv2.GaussianBlur(median_filter, (g_k, g_k), 0)
+	se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_k,se_k)) # build structuring element
+
+	# Distance transform calculation
+	thresh = cv2.threshold(image, 0, maxValue, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1] # OTSU thresholding
+	opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, se) # noise removal via morphological opening
+	D = cv2.distanceTransform(opening, cv2.DIST_L2, 5) # L2 distance transform
+
+	# Morphological Gradient Calculation
+	G = cv2.morphologyEx(gaussian_filter, cv2.MORPH_GRADIENT, se) # morphological gradient
+	G_min = np.min(G) # Global min of distance transform
+	G_max = np.max(G) # Global max of distance transform
+
+	# Gradient-weighted distance transform calculation
+	gw_D = cv2.GaussianBlur(D * np.exp(grad_weight*(1 - ((G - G_min)/(G_max-G_min)))), (g_k, g_k), 0)
+	dist_thresh = distThresh(np.uint8(gw_D), 20)
+	local_maxi = np.uint8(cv2.threshold(np.uint8(gw_D), dist_thresh*gw_D.max(), 255, 0)[1])
+	gwD_inv = cv2.GaussianBlur(np.max(gw_D) - gw_D, (g_k,g_k), 0)
+	# gw_D is larger at positions closer to the center of foreground objects and in pixels with smaller gradient values
+	# gw_D is smaller close to the boundaries of foreground objects and when the gradient is relatively large
+
+	# find markers using local maximimum:
+	#local_maxi = peak_local_max(gw_D, min_distance=2, indices=False, num_peaks=6, num_peaks_per_label=1) # local maxima on gradient-weighted distance transform
+	markers = ndi.label(local_maxi)[0] # label markers
+	labels = watershed(median_filter, markers, mask=opening)
+
+	if VISUALIZE is True:
+		f, a = plt.subplots(4,2, figsize=(9,6))
+		a[0,0].imshow(median_filter, "gray"), a[0,0].axis("off"), a[0,0].set_title("De-noised Image")
+		a[1,0].imshow(opening, "gray"), a[1,0].axis("off"), a[1,0].set_title("Thresholded Image")
+		a[2,0].imshow(D, "gray"), a[2,0].axis("off"), a[2,0].set_title("Distance Transform")
+		a[3,0].imshow(G, "gray"), a[3,0].axis("off"), a[3,0].set_title("Morphological Gradient")
+		a[0,1].imshow(gw_D, "gray"), a[0,1].axis("off"), a[0,1].set_title("Gradient-weighted Distance Transform")
+		a[1,1].imshow(gwD_inv, "gray"), a[1,1].axis("off"), a[1,1].set_title("Inv. Gradient-weighted Distance Transform")
+		a[2,1].imshow(markers), a[2,1].axis("off"), a[2,1].set_title("Markers (Local Maxima)")
+		a[3,1].imshow(labels), a[3,1].axis("off"), a[3,1].set_title("Watershed Segmentation")
+
+	# perform watershed
+	return(labels)
+
+def blot_stats(contour, image):
+	# area
+	area = cv2.contourArea(contour)
+
+	# texture
+	mask = np.zeros(image.shape, dtype=np.uint8)
+	cv2.drawContours(mask, [contour], 0, (255), -1)
+	mu, std = cv2.meanStdDev(image, mask=mask)
+	texture = std**2
+
+	# convexity
+	convexity = area/cv2.convexHull(contour)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
