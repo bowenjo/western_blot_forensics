@@ -9,6 +9,7 @@ from scipy.spatial import KDTree
 import itertools as itt
 from skimage.morphology import watershed
 from skimage.feature import peak_local_max
+from scipy.stats import multivariate_normal
 """
 Helpful utility functions for fingerprinting western blot images. 
 
@@ -63,85 +64,6 @@ def _equalizer(v, equ_LookUp):
 	return(equ_LookUp[v])
 
 
-def normalize(array):
-	return((array-np.min(array))/(np.max(array) - np.min(array) + np.finfo(float).eps))
-
-
-def distThresh(dist_transform, spacing_num):
-	"""
-	computes the distance threshold based on a weighting function maximizing number of contours and total area.
-	
-	#TODO: update weighting method for increased accuracy at extracting blots. Perhaps ncorporate variance and mean area. 
-
-	Parameters:
-	------------
-	dist_transform: numpy array
-		array of values describing the distance threshold of the contours
-	spacing_num: int
-		defines the number of values to try between zero and one
-	area_weight: float (default: .35)
-		weights the effect total area has on determination of the distance threshold
-
-	"""
-	stats = {"num_cnts":[]}
-
-	possible_thresh = np.linspace(0, 1, spacing_num)[1:]
-	for t in possible_thresh:
-		thresh_image = np.uint8(cv2.threshold(dist_transform,t*dist_transform.max(),255,0)[1])
-		cnts = cv2.findContours(thresh_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[1]
-		stats["num_cnts"].append(len(cnts))
-
-	weight = (stats["num_cnts"])
-
-	return(possible_thresh[np.argmax(weight)]) 
-
-
-def adaptiveDilation(binary_image, maxKernelSize=5, iterations=1, structure = cv2.MORPH_ELLIPSE):
-	"""
-	Does adaptive morphological dilation on binary images. Designed to do more dilation for segments with smaller area, 
-	and less dilation for those with large area. 
-
-	#TODO: use the variance (or other statistical measure) to weight the kernel size. So when the variance of the blots are lower, do less dilation. 
-
-	Parameters:
-	-------------
-	binary_image: numpy array
-		binary image to have dilation applied to
-	maxKernelSize: int (default = 7)
-		sets the maximum kernel size for dilation
-	iterations: int (default = 1)
-		sets the number of iterations to perform morphological dilation
-	structure: cv2 object (default = cv2.MORPH_ELLIPSE)
-		determines the shape of the kernel used for dilation
-
-	Returns:
-	------------
-	dilated_image: numpy array
-		output binary image after adaptive dilation
-	"""
-	copy = binary_image.copy()
-
-	contours = cv2.findContours(copy, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[1] # find outlines of binary image
-	areas = np.abs(np.array([cv2.contourArea(cnt) for cnt in contours])) # compute area
-	kernelSizes = np.maximum(np.around(maxKernelSize * (1 - areas / (np.sum(areas) + np.finfo(float).eps))).astype(int), 0) # get the kernel size weighted by area
-
-	dilated_image = np.zeros(binary_image.shape, dtype=np.uint8) # intitialize dileated image
-	for i, cnt in enumerate(contours):
-		mask = np.zeros(binary_image.shape, dtype=np.uint8) # intitialize background mask
-		cv2.drawContours(mask, [cnt], 0, (255), -1) # fill in contour outline for each contour
-
-		if kernelSizes[i] % 2 == 0: # make sure kernel size is odd
-			kernelSizes[i] = kernelSizes[i] + 1
-		#print(kernelSizes[i])
-
-		#kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernelSizes[i], kernelSizes[i])) # create kernel
-		kernel = np.ones((kernelSizes[i],kernelSizes[i]), dtype=np.uint8)
-		mask = cv2.dilate(mask, kernel, iterations = iterations) # dilate masked image for each filled in contour
-		dilated_image = cv2.add(dilated_image, mask) # add new filled-in outlined image to dilated image 
-	
-	return(dilated_image)
-
-
 def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMALIZE = True, Visualize = False):
 	""" 
 	performs a simplified histogram of oriented gradients operation on magnitude(mag) and direction(angle) arrays
@@ -167,7 +89,6 @@ def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMAL
 	-----------
 	feature_vector: numpy array (length = orientations)
 		accumulated magnitudes of specified orientation bin
-
 	"""
 	if blockShape[0] % binShape[0] != 0 or blockShape[1] % binShape[1] != 0:
 		raise ValueError("blockShape must be a whole-number multiple of binShape")
@@ -175,7 +96,6 @@ def HOG(image, blockShape = (4,8), binShape = (2,4), orientations = 8, L2_NORMAL
 	## Resample image to blockShape
 	rsmpld_image = cv2.resize(image, (blockShape[1], blockShape[0]), interpolation = cv2.INTER_NEAREST)
 	#rsmpld_image = cv2.GaussianBlur(rsmpld_image, (3,3), 1)
-
 
 	## Compute gradient at each resampled pixel
 	gx = cv2.Sobel(rsmpld_image, cv2.CV_64F, 1, 0, ksize = 1) # x:gradient
@@ -321,7 +241,7 @@ def filterContourArea(contours, figure_size, alpha=1000, beta=.01):
 		except IndexError:
 			cnt_t = 0
 		try:
-			cnt_f = np.where(areas < beta*areas[cnt_t])[0][0] # designate minimum area inde
+			cnt_f = np.where(areas < beta*areas[cnt_t])[0][0] # designate minimum area index
 			if cnt_f is None:
 				cnt_f = len(areas)
 		except IndexError:
@@ -371,50 +291,51 @@ def approxAndExtractRect(figure, contours, epsilon, size_lim, whr_lim, mode_lim,
 	if figures is None:
 		return(None)
 
-	# filter by size
-	sizes = np.sort([np.size(roi) for roi in figures["grays"]])[::-1]
-	size_t, size_f = _filterByIndex(sizes, size_lim)
-	size_idx = [i for i, roi in enumerate(figures["grays"]) if np.size(roi) in sizes[size_t:size_f]]
-	figures = _updateDictionary(figures, size_idx)
-	if figures is None:
-		return(None)
 
-	# filter by shape ratio
-	wh_ratio = np.sort([roi.shape[1]/roi.shape[0] for roi in figures["grays"]])[::-1]
-	wh_ratio_t, wh_ratio_f = _filterByIndex(wh_ratio, whr_lim)
-	shape_idx = [i for i, roi in enumerate(figures["grays"]) if (roi.shape[1]/roi.shape[0]) in wh_ratio[wh_ratio_t:wh_ratio_f]]
-	figures = _updateDictionary(figures, shape_idx)
-	if figures is None:
-		return(None)
+	# # filter by size
+	# sizes = np.sort([np.size(roi) for roi in figures["grays"]])[::-1]
+	# size_t, size_f = _filterByIndex(sizes, size_lim)
+	# size_idx = [i for i, roi in enumerate(figures["grays"]) if np.size(roi) in sizes[size_t:size_f]]
+	# figures = _updateDictionary(figures, size_idx)
+	# if figures is None:
+	# 	return(None)
 
-	# filter based on mode of histograms
-	hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
-	mode_ratio = np.sort([np.max(hist) for hist in hists])[::-1]
-	mode_ratio_t, mode_ratio_f = _filterByIndex(mode_ratio, mode_lim)
-	mode_idx = [i for i, hist in enumerate(hists) if np.max(hist) in mode_ratio[mode_ratio_t:mode_ratio_f]]
-	figures = _updateDictionary(figures, mode_idx) 
-	if figures is None:
-		return(None)
+	# # filter by shape ratio
+	# wh_ratio = np.sort([roi.shape[1]/roi.shape[0] for roi in figures["grays"]])[::-1]
+	# wh_ratio_t, wh_ratio_f = _filterByIndex(wh_ratio, whr_lim)
+	# shape_idx = [i for i, roi in enumerate(figures["grays"]) if (roi.shape[1]/roi.shape[0]) in wh_ratio[wh_ratio_t:wh_ratio_f]]
+	# figures = _updateDictionary(figures, shape_idx)
+	# if figures is None:
+	# 	return(None)
 
-	# filter based on distribution around mode
-	hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
-	hist_idx = []
-	for i, hist in enumerate(hists):
-		mode = np.argmax(hist)
-		try:
-			# right-shifted ratio
-			right_shift = np.arange(1, shift_length+1) + mode
-			if hist[mode] / (np.sum(hist[right_shift]) + np.finfo(float).eps) < hist_lim:
-				hist_idx.append(i)
-		except IndexError:
-			# left-shifted ratio
-			left_shift = np.arange(-shift_length-1, -1) + mode
-			if hist[mode] / (np.sum(hist[left_shift]) + np.finfo(float).eps) < hist_lim:
-				hist_idx.append(i)
+	# # filter based on mode of histograms
+	# hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
+	# mode_ratio = np.sort([np.max(hist) for hist in hists])[::-1]
+	# mode_ratio_t, mode_ratio_f = _filterByIndex(mode_ratio, mode_lim)
+	# mode_idx = [i for i, hist in enumerate(hists) if np.max(hist) in mode_ratio[mode_ratio_t:mode_ratio_f]]
+	# figures = _updateDictionary(figures, mode_idx) 
+	# if figures is None:
+	# 	return(None)
 
-	figures = _updateDictionary(figures, hist_idx)
-	if figures is None:
-		return(None)
+	# # filter based on distribution around mode
+	# hists = [np.histogram(roi.flatten(), np.arange(256), density=False)[0] for roi in figures["grays"]]
+	# hist_idx = []
+	# for i, hist in enumerate(hists):
+	# 	mode = np.argmax(hist)
+	# 	try:
+	# 		# right-shifted ratio
+	# 		right_shift = np.arange(1, shift_length+1) + mode
+	# 		if hist[mode] / (np.sum(hist[right_shift]) + np.finfo(float).eps) < hist_lim:
+	# 			hist_idx.append(i)
+	# 	except IndexError:
+	# 		# left-shifted ratio
+	# 		left_shift = np.arange(-shift_length-1, -1) + mode
+	# 		if hist[mode] / (np.sum(hist[left_shift]) + np.finfo(float).eps) < hist_lim:
+	# 			hist_idx.append(i)
+
+	# figures = _updateDictionary(figures, hist_idx)
+	# if figures is None:
+	# 	return(None)
 
 	# convert to array
 	figures["loc"] = np.array(figures["loc"])
@@ -471,128 +392,6 @@ def contrastFilters(figure, break_point):
 
 	return(np.uint8(y_))
 
-def detectLocalMinima(image, k, g_k, T, w, dub, c, slope_angle, order=1, VISUALIZE=False):
-	"""
-	detects local intensity minima in multiplets. Inspired by M.A. Savelonas et al. 2011
-
-	Parameters:
-	------------
-	image: numpy array 
-		2D gray-scale image in numpy array format
-	k: int
-		median filter kernel size
-	T: uint8
-		intensity threshold value. local intensity minima must exceed this value to be classified as minima
-	w: float
-		width of square sub-segment in which local minima must be global minima
-	order: int (default: 1)
-		How many points on each side to use for the comparison to consider
-
-	Returns:
-	-------------
-	local_mins: (n,2) numpy array
-		array of 2D locations of local minima within image
-	"""
-	# apply k x k median filter
-	image = cv2.medianBlur(image, k)
-	image = cv2.GaussianBlur(image, (g_k,g_k), 0)
-
-	# Find all indices of local min in each cardinal diection of 'image'
-	arg_local_min_x = np.asarray(argrelmin(image, order=order, axis=1)).T # indices of all local min in x-direction
-	arg_local_min_y = np.asarray(argrelmin(image, order=order, axis=0)).T # indiced of all local min in y-direction
-
-	# criterion 1: threshold local minima to be greater than or equal to 'T'
-	arg_local_min_x = [k for k in arg_local_min_x if image[tuple(k)] >= T] # threshold x-direction local min
-	arg_local_min_y = [k for k in arg_local_min_y if image[tuple(k)] >= T] # threshold y-direction local min
-
-
-	try:
-		arg_local_min =  arg_local_min_x + arg_local_min_y
-	except ValueError:
-		if len(arg_local_min_x) == 0:
-			arg_local_min = arg_local_min_y
-		elif len(arg_local_min_y) == 0:
-			arg_local_min = arg_local_min_x
-		elif len(arg_local_min_x) == 0 and len(arg_local_min_y) == 0:
-			print("No local minima detected. Adjust threshold T as necessary")
-			return(None, image) 
-		else:
-			raise ValueError("operands of shape %r and %r could not be broadcast together"%(arg_local_min_x.shape, arg_local_min_y.shape))
-
-	# criterion 2: local min must be global min in square neighborhood wth width w
-	local_mins = []
-	for k in arg_local_min:
-		local_min = image[tuple(k)]
-		# define bounds of square
-		lbx = int(np.maximum(k[0] - w/2, 0))
-		ubx = int(np.minimum(k[0] + w/2, image.shape[0]))
-		lby = int(np.maximum(k[1] - w/2, 0))
-		uby = int(np.minimum(k[1] + w/2, image.shape[1]))
-		# find global min of image sub-section
-		nbrh_min = np.min(image[lbx:ubx, lby:uby])
-		# check if k is global min of sub-section defined by w
-		if local_min <= nbrh_min:
-			local_mins.append(k)
-
-	if len(local_mins) != 0:
-		local_mins = np.vstack(local_mins)
-	else:
-		print("There were no border lines detected")
-		return(None, image)
-
-	# use kd-tree to find nearest neighbors
-	Tree = KDTree(local_mins) # create KDTree object
-	dists, locs = Tree.query(local_mins, k=7, distance_upper_bound = dub) # find nearest neighbors 
-
-	# group results of k-nearest neighbors into clusters
-	notInf = [i for i, x in enumerate(dists[:, 1:]) if _notInf(x)>=3] # remove single/double clusters
-	locs = locs[notInf] 
-
-	# group the results into clusters
-	clustered_min = []
-	for i, loc in enumerate(locs):
-		clust = []
-		for l in loc:
-			if l != len(local_mins):
-				if l not in [m for sublist in clustered_min for m in sublist]:
-					clust.append(l)
-		if len(clust) != 0:
-			clustered_min.append(clust)
-	clustered_min = [local_mins[clust] for clust in clustered_min]
-
-	# fit lines to clusters using opencv's least squares line fitting algorithm
-	fit_lines = [cv2.fitLine(clust, cv2.DIST_L2, 0, .01, .01) for clust in clustered_min if len(clust)>=3] # make sure there are at least 3 points in a cluster
-
-	# Filter unwanted slopes (i.e. not approx vertical or approx. horizontal)
-	del_idx = []
-	for _, line in enumerate(fit_lines):
-		slope = np.arctan(np.abs(line[0]/(line[1] + np.finfo(float).eps))) * 180/np.pi # calculate slope of fitted line
-		if slope < slope_angle[0] and slope > slope_angle[1]: # delete line if within slope_angle range
-			del_idx.append(_)
-
-	fit_lines = [fit_lines[i] for i, line in enumerate(fit_lines) if i not in del_idx]  
-
-	copy= image.copy()
-	for line in fit_lines:
-		pt1 = (line[3] - c*line[1], line[2] - c*line[0])
-		pt2 = (line[3] + c*line[1], line[2] + c*line[0])
-		cv2.line(copy, pt1, pt2, color = (0), thickness=1)
-
-	if VISUALIZE is True:
-		plt.figure(figsize=(7,3))
-		plt.imshow(copy, "gray")
-		plt.axis("off")
-		plt.title("Border lines calculated from local minima")
-
-	return(fit_lines, copy)
-
-def _notInf(numbers):
-	count = 0
-	for num in numbers:
-		if not np.isinf(num):
-			count+=1
-	return(count)
-
 def CLAHE(image, clipLimit, tileGridSize):
 	"""
 	Parameters:
@@ -610,79 +409,293 @@ def CLAHE(image, clipLimit, tileGridSize):
 	clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
 	return(clahe.apply(image))
 
-def gwWatershed(image, md_k, se_k, g_k, grad_weight, maxValue=255, VISUALIZE=False):
+
+def mergeWatershedLines(locs, image_shape, alpha):
+	## GOAL:
+	# - assume watershed segemntation is not undersegmented.
+	# - find maximum blot dimensions in the image. This assumes that in most cases at least one blot will be segmented correctly
+	# - compare other segmentation dimensions to max dimensions.
+	# - if segments dimensions << max dimensions and connected to another << max dimensions segment, merge the segments.
+	# - consider more than two segments merging. This will account for touching oversegmentations. 
+
+	## TODO: 
+	# - for each small-width blot, find closest neighboring blot. If distance between closest neighbor is 
+	#	significantly smaller than mean closest-neighbor-distance, merge blots. This will account for non-touching oversegmentations
+	# - weight merging from width by multivariate confidence score ratio (post-merge confidence/pre-merge confidence). This will account for 
+	#	over-merging due to possible undersegmentation in the image (which is against the assumption made in the goals). 
+
+	# initialize widths
+	widths = [rect[2] for rect in locs["loc"]]
+	max_w = np.max(widths) 
+
+	# find partial segments form max width calculation
+	ps_idx = [idx for idx, w in enumerate(widths) if w <= alpha * max_w]
+	fs_idx = [idx for idx, w in enumerate(widths) if w > alpha * max_w]
+	ps_cnts = locs["contours"][ps_idx]
+	fs_cnts = locs["contours"][fs_idx]
+
+	# draw partial segments
+	mask = np.zeros(image_shape, dtype=np.uint8) # create backgroud to superimpose contours on
+	cv2.drawContours(mask, ps_cnts, -1, (255), -1) # superimpose contours onto background
+	merged = cv2.connectedComponents(mask)[1] # merge connected components 
+
+	# add on full segments
+	for i, seg in enumerate(fs_cnts):
+		color = int(i + (np.max(merged)+1))
+		cv2.drawContours(merged, [seg], 0, (color), -1)
+
+	return(merged)
+
+def minDistCnt(cnt1, cnt2):
+	minimum_distances = []
+	for pt1 in cnt1:
+		min_dist = np.min([np.linalg.norm(pt1 - pt2) for pt2 in cnt2])
+		minimum_distances.append(min_dist)
+
+	return(np.min(minimum_distances))
+
+def groupRepeats(N):
+	""" 
+	groups repeated sequences of a float in a 1-D array
 	"""
-	Gradient-weighted watershed transform. Inspired by Lin et. al. 2003
+	pointer = np.append(np.where(np.diff(N)!=0), len(N)-1) # indices pointing to grouped array
+	return((pointer, N[pointer]))
+
+def scanForLocalMin(image, T, order, line_type):
+	"""
+	scans image for local minima with horizontal and vertical scanning-lines 
+	"""
+	local_min = {'x':[],'y':[]} # initialize dots dictionary
+	for idx, line in enumerate(image):
+		g_line = groupRepeats(line) # group repeated sequences
+		x = g_line[0][argrelmin(g_line[1], order=order)] # find x-components of local min
+		y = [idx]*len(x) # find corresponding y-components of local min
+		local_min["x"] = np.append(local_min["x"], x) 
+		local_min["y"] = np.append(local_min["y"], y)   
+
+	# filter out local min above intensity T
+	thresh_idx = [i for i, m in enumerate(np.int64(list(zip(local_min["y"],local_min["x"])))) if image[tuple(m)] <= T]
+
+	if len(thresh_idx) != 0:
+		for key in local_min.keys():
+			local_min[key] = np.array(local_min[key])[thresh_idx]
+	else:
+		local_min = None
+
+	return(local_min)
+
+def gridLocalMin(image, T, order):
+	"""
+	finds the indices for x,y-grid local min
+	"""
+	horizontal = scanForLocalMin(image, T, order[0], line_type='h')
+	vertical = scanForLocalMin(image.T, T, order[1], line_type='v')
+	if horizontal is not None:
+		h_coord = (np.array(horizontal["y"]).astype(np.int64), np.array(horizontal["x"]).astype(np.int64))
+	else:
+		h_coord = None
+	if vertical is not None:
+		v_coord = (np.array(vertical["x"]).astype(np.int64), np.array(vertical["y"]).astype(np.int64))
+	else:
+		v_coord = None
+
+	return(h_coord, v_coord)
+
+def gridLineDetector(image, pts, vote_lim, dist_thresh, line_type, kernel_size, alpha, mask=None):
+	"""
+	Draws division lines in the image defined by local minima
 
 	Parameters:
-	-------------
+	--------------
 	image: numpy array
-		gray-scale intensity image
-	k: int
-		median filter kernel size
-	maxValue: uint8 (default=255)
-		maximim value for otsu thresholding function
+		image array to draw divide lines on
+	pts: tuple of arrays
+		x, y coordinates of local minima 
+	vote_lim: int
+		the number of votes that a divide line must exceed to be drawn
+	dist_thresh: int
+		the minimum number of pixels between divide lines
+	line_type: str
+		'h' - horizontal 
+		'v' - vertical
+	kernel_size: int (odd) 
+		size of kernel to sum points over
+	alpha: float
+		number of standard diviations away from mean to count divide line
+	mask: numpy array (same dim as image)
+		optional image mask
 
 	Returns:
 	-------------
+	divide_line_image: numpy array (same dim as image)
+		image with divide lines drawn
 
 	"""
 
-	# preprocess image
-	median_filter = cv2.medianBlur(image, md_k) # median filter
-	#median_filter = CLAHE(median_filter, clipLimit = 2, tileGridSize=(5,5))
-	gaussian_filter = cv2.GaussianBlur(median_filter, (g_k, g_k), 0)
-	se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_k,se_k)) # build structuring element
+	# Draw local minima
+	dots = np.zeros_like(image, dtype=np.uint8)
+	if pts is None:
+		return(image)
+	dots[pts] = 1
+	# mask the local minima
+	if mask is not None:
+		dots = cv2.bitwise_and(dots, dots, mask=mask)
+		dots = np.float32(dots)
 
-	# Distance transform calculation
-	thresh = cv2.threshold(image, 0, maxValue, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1] # OTSU thresholding
-	opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, se) # noise removal via morphological opening
-	D = cv2.distanceTransform(opening, cv2.DIST_L2, 5) # L2 distance transform
+	# sum over the respected axis
+	if line_type == 'h':
+		votes = np.sum(dots, axis=0)
+	elif line_type == 'v':
+		votes = np.sum(dots, axis=1)
+	else:
+		raise NameError(line_type + " is not a recognized line_type")
 
-	# Morphological Gradient Calculation
-	G = cv2.morphologyEx(gaussian_filter, cv2.MORPH_GRADIENT, se) # morphological gradient
-	G_min = np.min(G) # Global min of distance transform
-	G_max = np.max(G) # Global max of distance transform
+	# calculate votes with a filter
+	kernel = np.ones(kernel_size)
+	votes = np.convolve(votes, kernel)
 
-	# Gradient-weighted distance transform calculation
-	gw_D = cv2.GaussianBlur(D * np.exp(grad_weight*(1 - ((G - G_min)/(G_max-G_min)))), (g_k, g_k), 0)
-	dist_thresh = distThresh(np.uint8(gw_D), 20)
-	local_maxi = np.uint8(cv2.threshold(np.uint8(gw_D), dist_thresh*gw_D.max(), 255, 0)[1])
-	gwD_inv = cv2.GaussianBlur(np.max(gw_D) - gw_D, (g_k,g_k), 0)
-	# gw_D is larger at positions closer to the center of foreground objects and in pixels with smaller gradient values
-	# gw_D is smaller close to the boundaries of foreground objects and when the gradient is relatively large
+	if np.all(votes==0):
+		return(image)
 
-	# find markers using local maximimum:
-	#local_maxi = peak_local_max(gw_D, min_distance=2, indices=False, num_peaks=6, num_peaks_per_label=1) # local maxima on gradient-weighted distance transform
-	markers = ndi.label(local_maxi)[0] # label markers
-	labels = watershed(median_filter, markers, mask=opening)
+	# Decide on divide lines from alpha parameter
+	mean = np.mean(votes[np.where(votes>0)])
+	std = np.std(votes[np.where(votes>0)])
 
-	if VISUALIZE is True:
-		f, a = plt.subplots(4,2, figsize=(9,6))
-		a[0,0].imshow(median_filter, "gray"), a[0,0].axis("off"), a[0,0].set_title("De-noised Image")
-		a[1,0].imshow(opening, "gray"), a[1,0].axis("off"), a[1,0].set_title("Thresholded Image")
-		a[2,0].imshow(D, "gray"), a[2,0].axis("off"), a[2,0].set_title("Distance Transform")
-		a[3,0].imshow(G, "gray"), a[3,0].axis("off"), a[3,0].set_title("Morphological Gradient")
-		a[0,1].imshow(gw_D, "gray"), a[0,1].axis("off"), a[0,1].set_title("Gradient-weighted Distance Transform")
-		a[1,1].imshow(gwD_inv, "gray"), a[1,1].axis("off"), a[1,1].set_title("Inv. Gradient-weighted Distance Transform")
-		a[2,1].imshow(markers), a[2,1].axis("off"), a[2,1].set_title("Markers (Local Maxima)")
-		a[3,1].imshow(labels), a[3,1].axis("off"), a[3,1].set_title("Watershed Segmentation")
 
-	# perform watershed
-	return(labels)
+	truth_value = (votes > (mean + alpha*std)) * (votes > vote_lim)
+	divides = np.where(truth_value)[0]
 
-def blot_stats(contour, image):
-	# area
-	area = cv2.contourArea(contour)
+	# draw divide lines
+	last_index = 0
+	divide_line_image = image.copy()
+	for idx, axis in enumerate(divides):
+		if idx > 0:
+			if (axis - divides[last_index]) > dist_thresh: # divide lines must be at least dist_thresh pixels between each other
+				last_index = idx
+				try:
+					if line_type == 'h':
+						divide_line_image[:,axis]=0
+					else:
+						divide_line_image[axis,:]=0
+				except IndexError:
+					continue
+		else:
+			last_index = idx
+			try:
+				if line_type == 'h':
+					divide_line_image[:,axis]=0
+				else:
+					divide_line_image[axis,:]=0
+			except IndexError:
+				continue
 
-	# texture
+	return(divide_line_image)
+
+def findMarkers(image, segmented_image):
+	"""
+	finds the markers for watershed algorithm given segmented, course binary image
+	"""
+	coarse_markers = cv2.connectedComponents(segmented_image)[1]
+	fine_markers = np.zeros_like(image, dtype=np.uint8)
+	for cm in np.unique(coarse_markers)[1:]:
+		mask = np.zeros_like(segmented_image, dtype=np.uint8)
+		mask[coarse_markers == cm] = 255
+		min_loc = cv2.minMaxLoc(image, mask=mask)[2]
+		cv2.circle(fine_markers, min_loc, 1, (255), -1)
+
+	fine_markers = cv2.connectedComponents(fine_markers)[1]
+
+	return(fine_markers)
+
+def solidity(contour):
+	"""
+	finds solidity (ratio of contour area to its convex hull area)
+	"""
+	cnt_area = cv2.contourArea(contour)
+	hull = cv2.convexHull(contour)
+	hull_area = cv2.contourArea(hull)
+
+	if hull_area != 0:
+		return(cnt_area / hull_area + np.finfo(float).eps)
+	else:
+		return(0)
+
+def eccentricity(contour):
+	if len(contour) > 5:
+		(cx, cy), (MA,ma), theta = cv2.fitEllipse(contour)
+		eccentricity = MA/(ma + np.finfo(float).eps)
+	else:
+		eccentricity = 0
+
+	return(eccentricity)
+
+def circularity(contour, image):
 	mask = np.zeros(image.shape, dtype=np.uint8)
 	cv2.drawContours(mask, [contour], 0, (255), -1)
-	mu, std = cv2.meanStdDev(image, mask=mask)
-	texture = std**2
 
+	dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+	mu_dt, stdDev_dt = cv2.meanStdDev(dist, mask=mask)
+	circularity = mu_dt/(stdDev_dt + np.finfo(float).eps)
+
+	return(circularity)
+
+def spread(contour, image, num_bins):
+	# hist, bins = np.histogram(image.flatten(), num_bins, [0, num_bins], density = False)
+	# spread = np.nonzero(hist)[0].size / (num_bins-1)
+	mask = np.zeros(image.shape, dtype=np.uint8)
+	cv2.drawContours(mask, [contour], 0, (255), -1)
+
+	hist = cv2.calcHist([image], [0], mask, [num_bins], [0,num_bins])
+	spread = np.nonzero(hist)[0].size / (num_bins-1)
+
+	return(spread)
+
+def width(contour):
+	width = cv2.boundingRect(cnt)[2]
+
+def blot_stats(contour, image, num_bins):
+	"""
+	Note: These stats where designed to be used to produce a model for "ideal" blot shape. It was going to be used for merging oversegmented blot.
+	However, the variability of the dataset in these statistics makes it difficult to  
+	"""
+	# eccentricity
+	ecc = eccentricity(contour)
 	# convexity
-	convexity = area/cv2.convexHull(contour)
+	conv = solidity(contour)
+	# circularity
+	circ  = circularity(contour, image)
+	# spread
+	spr = spread(contour, image, 256)
+
+	return([ecc, conv, circ, spr])
+
+def dtwGradient(image, binary_image, alpha):
+    DT = cv2.distanceTransform(binary_image, cv2.DIST_L2, 5)
+    DT_max = np.max(DT)
+    DT_min = np.min(DT)
+    
+    dtwImage = image * np.exp(-alpha * (DT-DT_min)/(DT_max - DT_min))
+    
+    return(dtwImage.astype(np.uint8), cv2.cvtColor(dtwImage, cv2.COLOR_GRAY2BGR).astype(np.uint8))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
