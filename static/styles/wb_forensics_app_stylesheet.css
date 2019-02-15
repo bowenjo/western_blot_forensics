@@ -1,0 +1,27 @@
+img {
+	display: block;
+}
+
+table, th, td {
+   border: 2px solid black;
+}
+
+
+h1 {
+    color: maroon;
+} 
+
+div.columns {
+    column-width: 500px;
+    -moz-column-width: 500px;
+    -webkit-column-width: 400px;
+ }
+
+div.keeptogether {
+    display: inline-block;
+    width: 100%;
+ }
+
+/* body {
+ 	background: cyan;
+ }*/
