@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+
+
+ <head>
+    <meta charset="utf-8" />
+    <title>Western-Blot Checker</title>
+    <link rel= "stylesheet" type= "text/css" href= "{{ url_for('static',filename='styles/wb_forensics_app_stylesheet.css') }}">
+</head>
+
+  <body>
+    <header>
+      <h1>Western-Blot Checker</h1>
+    </header>
+
+    <div class='columns'>
+
+        <!-- Display the whole figure here -->
+        <div class='keeptogether'>
+        	<h3>Load Figure and Compute Fingerprints</h3>
+
+                <form method=post action="" enctype="multipart/form-data">
+        			<table>
+        				<!-- Figure file field -->
+        				<tr>
+        					<td> {{ form["figure"].filename.label }} </td>
+        					<td> {{ form["figure"].filename(size=20) }} </td>
+        				</tr>
+                        <tr>
+                            <td> {{ form["figure"].thresh.label }} </td>
+                            <td> {{ form["figure"].thresh(size=4) }}</td>
+                        </tr>
+        				<!-- Show matches in figure -->
+        				<tr>
+        					<td> {{ form["figure"].show_match.label }} </td>
+        					<td> {{ form["figure"].show_match(size=5) }}</td>
+        				</tr>
+        				<!-- Compute button -->
+        				<tr>
+        					<td> <input type="submit" name="btn" value="Display Figure"></td>
+        				</tr>
+
+        			</table>
+                </form>
+
+             <!-- View the result -->
+            {% if result["figure"] != None %}
+            <img src="{{ result['figure'] }}" width="800" height="400">
+            {% endif %}
+
+                    		
+        </div>
+
+        {% if result["figure"] != None %}
+        <!-- Do feature matching and display affine transformations here -->
+        <div class='keeptogether'>
+        	<h3>Match Checker</h3>
+
+        	<form method=post action="" enctype="multipart/form-data">
+        		<table>
+        			<!-- Choose match -->
+        			<tr>
+        				<td><h5>Index:</h5></td>
+        				<td> {{ form["match"].group_id(size=4)}} </td>
+        			</tr>
+                    <!-- Display options -->
+                    <tr>
+                        <td><h5>{{ form["match"].heatmap.label }}:</h5></td>
+                        <td> {{ form['match'].heatmap(size=4) }} </td>
+                    </tr>
+        			<!-- Matching options -->
+        			<tr>
+        				<td><h5>Match:</h5></td>
+        				<td> {{ form["match"].affine_match.label }} </td>
+        				<td> {{ form["match"].affine_match(size=5)}} </td>
+        				<td> {{ form["match"].contrast.label }} </td>
+        				<td> {{ form["match"].contrast(size=5)}} </td>
+        			</tr>
+    				<tr>
+    					<td> <input type="submit" name="btn" value="Check Match"></td>
+    				</tr>
+
+        		</table>
+
+        		<!-- View Result -->
+    			{% if result["image_match"] != None %}
+                <h4>Image matches:</h4>
+                <table>
+                    <tr>
+                        <td> Index: {{ form["match"].group_id.data[1] }} </td>
+                        <td> Index: {{ form["match"].group_id.data[3] }} </td>
+                    </tr>
+                    <tr>
+                        <td><img src="{{ result['image_match'][0] }}" width="400" height="100"></td>
+                        <td><img src="{{ result['image_match'][1] }}" width="400" height="100"></td>
+                    </tr>
+                </table>
+
+                <h4>Feature matches:</h4>
+                <table>
+                    <thead>
+                        <td style="text-align: center; vertical-align: middle;">Target</td>   
+                        <td style="text-align: center; vertical-align: middle;">Adjusted</td>
+                        <td style="text-align: center; vertical-align: middle;">Unadjusted</td>
+                        <td style="text-align: center; vertical-align: middle;">Rotation Angle</td>
+                        <td style="text-align: center; vertical-align: middle;">Reflection</td>
+                        <td style="text-align: center; vertical-align: middle;">Scaling</td>
+                        <td style="text-align: center; vertical-align: middle;">Match Score</td>
+                    </thead>
+                    {% for res in result["feature_match"] %}
+                    <tr>
+                        <td colspan="3" style="text-align: center; vertical-align: middle;"><img src="{{ res[0] }}" width="400" height="100"></td>
+                        <td style="text-align: center; vertical-align: middle;">{{ res[1] }}</td>
+                        <td style="text-align: center; vertical-align: middle;">{{ res[2] }}</td>
+                        <td style="text-align: center; vertical-align: middle;">{{ res[3] }}</td>
+                        <td style="text-align: center; vertical-align: middle;">{{ res[4] }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+    			{% endif %}
+    			
+        	</form>
+
+        </div>
+        {% endif %}
+    </div>
+
+  </body>
+
+</html>
